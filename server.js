@@ -2,7 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
-const crypto = require("crypto");
 
 const { PLATFORM_ID, API_SECRET, makeSignature } = require("./helpers/passimpay");
 
@@ -11,204 +10,256 @@ app.use(cors());
 app.use(express.json());
 
 // ===== "База данных" в памяти (для прототипа) =====
+// playerId -> { balance, nickname, email }
 const players = new Map();
-const deposits = new Map();
-const rounds = new Map(); // раунды ставок
 
-function getOrCreatePlayer(playerId) {
-  if (!players.has(playerId)) {
-    players.set(playerId, {
-      id: playerId,
-      balance: 100.0, // стартовый демо-баланс
-    });
-  }
-  return players.get(playerId);
+// orderId -> { orderId, userId, paymentId, amountFiat, address, destinationTag, status }
+const deposits = new Map();
+
+// roundId -> { roundId, playerId, bet, multiplier, status }
+const rounds = new Map();
+
+// ===== Вспомогательные функции =====
+function generateId(prefix = "") {
+  return (
+    prefix +
+    Math.random().toString(36).slice(2, 10) +
+    Date.now().toString(36).slice(2)
+  );
 }
 
-// ============= 1) СЕССИЯ ИГРОКА =============
+function getOrCreatePlayer(playerIdFromClient) {
+  let playerId = playerIdFromClient;
+
+  if (playerId && players.has(playerId)) {
+    return { playerId, player: players.get(playerId) };
+  }
+
+  // создаём нового игрока
+  playerId = generateId("p_");
+  const player = {
+    balance: 100, // стартовый демо-баланс
+    nickname: null,
+    email: null,
+  };
+  players.set(playerId, player);
+
+  return { playerId, player };
+}
+
+// Аккуратное логирование (без секретов)
+function log(...args) {
+  console.log("[API]", ...args);
+}
+
+// ===== 1) Сессия игрока =====
+// Возвращает playerId + баланс + профиль
 app.get("/api/session", (req, res) => {
-  const playerId = "demo-player-1"; // потом заменим на реальную авторизацию
-  const player = getOrCreatePlayer(playerId);
-
-  res.json({
-    playerId: player.id,
-    balance: player.balance,
-  });
-});
-
-// ============= 2) СТАВКА: СТАРТ РАУНДА =============
-app.post("/api/bet/start", (req, res) => {
   try {
-    const { playerId, bet } = req.body;
+    const clientPlayerId =
+      req.headers["x-player-id"] ||
+      req.query.playerId ||
+      req.body?.playerId;
 
-    if (!playerId || !bet || bet <= 0) {
-      return res.status(400).json({ error: "Invalid bet" });
-    }
+    const { playerId, player } = getOrCreatePlayer(clientPlayerId);
 
-    const player = getOrCreatePlayer(playerId);
-
-    if (player.balance < bet) {
-      return res.status(400).json({ error: "Not enough balance" });
-    }
-
-    // списываем ставку
-    player.balance -= bet;
-
-    const roundId = "round_" + crypto.randomBytes(8).toString("hex");
-    rounds.set(roundId, {
-      id: roundId,
+    return res.json({
       playerId,
-      bet,
-      status: "in_progress",
-      multiplier: 1,
-    });
-
-    res.json({
-      roundId,
       balance: player.balance,
+      nickname: player.nickname || null,
+      email: player.email || null,
     });
   } catch (e) {
-    console.error("bet/start error:", e);
-    res.status(500).json({ error: "Internal error" });
+    console.error("GET /api/session error:", e);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
-// ============= 3) СТАВКА: ЗАВЕРШЕНИЕ РАУНДА =============
-app.post("/api/bet/finish", (req, res) => {
+// ===== 2) Регистрация / обновление профиля =====
+app.post("/api/profile/register", (req, res) => {
   try {
-    const { playerId, roundId, result, multiplier } = req.body;
+    const { playerId, nickname, email } = req.body || {};
 
-    if (!playerId || !roundId || !result) {
-      return res.status(400).json({ error: "Invalid finish payload" });
+    if (!playerId) {
+      return res.status(400).json({ error: "playerId is required" });
     }
 
-    const round = rounds.get(roundId);
-    if (!round || round.playerId !== playerId) {
-      return res.status(400).json({ error: "Round not found" });
+    const trimmedNickname = (nickname || "").toString().trim();
+    const trimmedEmail = (email || "").toString().trim();
+
+    if (!trimmedNickname) {
+      return res.status(400).json({ error: "Введите никнейм" });
     }
 
-    if (round.status !== "in_progress") {
-      return res.status(400).json({ error: "Round already finished" });
-    }
-
-    const player = getOrCreatePlayer(playerId);
-
-    let winAmount = 0;
-    if (result === "win") {
-      const m = Number(multiplier) || 1;
-      winAmount = round.bet * m;
-      player.balance += winAmount;
-      round.multiplier = m;
-      round.status = "win";
+    let player = players.get(playerId);
+    if (!player) {
+      // если по какой-то причине игрока ещё нет – создаём
+      player = {
+        balance: 100,
+        nickname: trimmedNickname,
+        email: trimmedEmail || null,
+      };
+      players.set(playerId, player);
     } else {
-      round.status = "lose";
+      player.nickname = trimmedNickname;
+      player.email = trimmedEmail || null;
     }
 
-    res.json({
+    log("Profile updated:", playerId, player.nickname, player.email);
+
+    return res.json({
+      playerId,
       balance: player.balance,
-      win: winAmount,
-      result: round.status,
+      nickname: player.nickname,
+      email: player.email,
     });
   } catch (e) {
-    console.error("bet/finish error:", e);
-    res.status(500).json({ error: "Internal error" });
+    console.error("POST /api/profile/register error:", e);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
-// ============= 4) СОЗДАНИЕ ДЕПОЗИТА (АДРЕС ОПЛАТЫ) =============
+// ===== 3) Депозит через PassimPay =====
+// Ожидаем: { userId, amountFiat, paymentId }
 app.post("/api/deposit/create", async (req, res) => {
   try {
-    const userId = req.body.userId || "demo-player-1";
-    const paymentId = Number(req.body.paymentId || 10); // ID монеты в PassimPay
-    const amountFiat = Number(req.body.amountFiat || 50);
+    const { userId, amountFiat, paymentId } = req.body || {};
 
-    const orderId = `dep_${userId}_${Date.now()}`;
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+    const amountNum = Number(amountFiat);
+    if (!amountNum || amountNum <= 0) {
+      return res.status(400).json({ error: "Invalid amountFiat" });
+    }
+    const paymentIdNum = Number(paymentId);
+    if (!paymentIdNum) {
+      return res.status(400).json({ error: "Invalid paymentId" });
+    }
 
-    const body = {
-      platformId: PLATFORM_ID,
-      paymentId,
-      orderId,
+    if (!players.has(userId)) {
+      // создаём игрока, если по какой-то причине нет
+      getOrCreatePlayer(userId);
+    }
+
+    const orderId = generateId("d_");
+
+    // Тело запроса к Passimpay
+    const payload = {
+      platform_id: PLATFORM_ID,
+      payment_id: paymentIdNum,
+      // сумма в фиате, которую мы хотим получить
+      amount: amountNum,
+      currency: "USD", // при необходимости поменяй на свою базовую валюту
+      order_id: orderId,
+      is_payment_multiple: 0,
+      lifetime: 3600,
+      callback_url: process.env.PASSIMPAY_CALLBACK_URL || "",
     };
 
-    const signature = makeSignature(body);
+    const sign = makeSignature(payload, API_SECRET);
+    const body = { ...payload, sign };
+
+    log("Creating PassimPay address", { userId, amountFiat: amountNum, paymentId: paymentIdNum });
 
     const resp = await fetch("https://api.passimpay.io/v2/address", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-signature": signature,
       },
       body: JSON.stringify(body),
     });
 
     const data = await resp.json();
-    console.log("PassimPay /v2/address response:", data);
+    log("PassimPay /v2/address response:", data);
 
     if (!resp.ok || data.result !== 1) {
       return res.status(400).json({ error: "PassimPay error", details: data });
     }
 
+    const payData = data.data || {};
+    const address = payData.address || payData.payin_address || null;
+    const destinationTag =
+      payData.destination_tag ||
+      payData.memo ||
+      payData.payin_extra_id ||
+      null;
+
     deposits.set(orderId, {
       orderId,
       userId,
-      paymentId,
-      amountFiat,
+      paymentId: paymentIdNum,
+      amountFiat: amountNum,
+      address,
+      destinationTag,
       status: "pending",
     });
 
-    res.json({
+    return res.json({
       orderId,
-      address: data.address,
-      destinationTag: data.destinationTag || null,
+      address,
+      destinationTag,
     });
   } catch (e) {
-    console.error("deposit/create error:", e);
-    res.status(500).json({ error: "Internal error" });
+    console.error("POST /api/deposit/create error:", e);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
-// ============= 5) WEBHOOK ДЕПОЗИТА ОТ PASSIMPAY =============
+// ===== 4) Webhook PassimPay для депозитов =====
+// PassimPay будет вызывать этот урл при поступлении оплаты
 app.post("/passimpay/webhook/deposit", (req, res) => {
   try {
-    const body = req.body;
-    const receivedSignature = req.headers["x-signature"];
+    const body = req.body || {};
 
-    const serializedBody = JSON.stringify(body);
-    const signatureContract = `${PLATFORM_ID};${serializedBody};${API_SECRET}`;
-    const expectedSignature = crypto
-      .createHmac("sha256", API_SECRET)
-      .update(signatureContract)
-      .digest("hex");
+    // В webhooks Passimpay обычно присылает sign в теле
+    const { sign, ...dataForCheck } = body;
+    const expectedSign = makeSignature(dataForCheck, API_SECRET);
 
-    if (!receivedSignature || receivedSignature !== expectedSignature) {
-      console.warn("Invalid PassimPay signature");
-      return res.status(400).send("Invalid signature");
+    if (!sign || sign !== expectedSign) {
+      console.warn("Invalid PassimPay webhook signature");
+      return res.status(403).send("invalid signature");
     }
 
-    const { type, orderId, amountReceive } = body;
+    const orderId = body.order_id || body.orderId;
+    const status = body.status; // см. формат Passimpay: может быть 1 / "success" и т.п.
 
-    if (type !== "deposit") {
-      return res.status(200).send("ignored");
-    }
-
-    const dep = deposits.get(orderId);
-    if (!dep) {
-      console.warn("Deposit not found for orderId", orderId);
+    if (!orderId || !deposits.has(orderId)) {
+      console.warn("Deposit webhook: unknown orderId:", orderId);
       return res.status(200).send("ok");
     }
 
-    if (dep.status === "success") {
+    const deposit = deposits.get(orderId);
+
+    // если уже обработали — просто подтверждаем
+    if (deposit.status === "confirmed") {
       return res.status(200).send("ok");
     }
 
-    dep.status = "success";
-    dep.amountCrypto = amountReceive;
+    // Проверяем успешный статус
+    const successStatuses = ["success", "paid", "1", 1];
+    if (!successStatuses.includes(status)) {
+      console.warn("Deposit webhook: non-success status:", status);
+      return res.status(200).send("ok");
+    }
 
-    const player = getOrCreatePlayer(dep.userId);
-    // временно: 1 к 1 к нашим монетам
-    player.balance += Number(amountReceive || 0);
+    // Зачисляем фиатную сумму, которую запрашивали изначально
+    const player = players.get(deposit.userId);
+    if (!player) {
+      console.warn("Deposit webhook: player not found:", deposit.userId);
+      return res.status(200).send("ok");
+    }
 
-    console.log(`Deposit success: user=${dep.userId}, +${amountReceive}`);
+    player.balance += deposit.amountFiat;
+    deposit.status = "confirmed";
+
+    log("Deposit confirmed:", {
+      orderId,
+      userId: deposit.userId,
+      amountFiat: deposit.amountFiat,
+      newBalance: player.balance,
+    });
+
     return res.status(200).send("ok");
   } catch (e) {
     console.error("webhook/deposit error:", e);
@@ -216,7 +267,124 @@ app.post("/passimpay/webhook/deposit", (req, res) => {
   }
 });
 
-// ============= 6) ПРОСТОЙ РУТ ДЛЯ ПРОВЕРКИ =============
+// ===== 5) Ставки =====
+
+// Старт раунда
+// body: { playerId, bet }
+app.post("/api/bet/start", (req, res) => {
+  try {
+    const { playerId, bet } = req.body || {};
+    if (!playerId) {
+      return res.status(400).json({ error: "playerId is required" });
+    }
+    const betNum = Number(bet);
+    if (!betNum || betNum <= 0) {
+      return res.status(400).json({ error: "Invalid bet" });
+    }
+
+    let player = players.get(playerId);
+    if (!player) {
+      // если игрок не найден, создаём нового (но это в теории странно)
+      const created = getOrCreatePlayer(playerId);
+      player = created.player;
+    }
+
+    if (player.balance < betNum) {
+      return res.status(400).json({ error: "Недостаточно средств" });
+    }
+
+    player.balance -= betNum;
+
+    const roundId = generateId("r_");
+    const round = {
+      roundId,
+      playerId,
+      bet: betNum,
+      multiplier: 1,
+      status: "active",
+    };
+    rounds.set(roundId, round);
+
+    log("Round started:", { roundId, playerId, bet: betNum, balance: player.balance });
+
+    return res.json({
+      roundId,
+      balance: player.balance,
+    });
+  } catch (e) {
+    console.error("POST /api/bet/start error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Завершение раунда
+// body: { playerId, roundId, result, multiplier }
+app.post("/api/bet/finish", (req, res) => {
+  try {
+    const { playerId, roundId, result, multiplier } = req.body || {};
+
+    if (!playerId || !roundId) {
+      return res.status(400).json({ error: "playerId and roundId are required" });
+    }
+
+    const round = rounds.get(roundId);
+    if (!round) {
+      return res.status(400).json({ error: "Round not found" });
+    }
+
+    if (round.playerId !== playerId) {
+      return res.status(403).json({ error: "Round does not belong to player" });
+    }
+
+    if (round.status !== "active") {
+      // уже завершён, просто вернём актуальный баланс
+      const player = players.get(playerId);
+      return res.json({
+        balance: player ? player.balance : 0,
+        win: 0,
+      });
+    }
+
+    let player = players.get(playerId);
+    if (!player) {
+      // на всякий случай создадим, но баланс уже будет странным
+      const created = getOrCreatePlayer(playerId);
+      player = created.player;
+    }
+
+    let win = 0;
+    round.status = result === "won" ? "won" : "lost";
+    round.multiplier = Number(multiplier) || 1;
+
+    if (round.status === "won") {
+      const m = Math.max(1, round.multiplier);
+      win = round.bet * m;
+      // округление до 2 знаков
+      win = Math.round(win * 100) / 100;
+      player.balance += win;
+    }
+
+    log("Round finished:", {
+      roundId,
+      playerId,
+      result: round.status,
+      bet: round.bet,
+      multiplier: round.multiplier,
+      win,
+      balance: player.balance,
+    });
+
+    return res.json({
+      balance: player.balance,
+      win,
+    });
+  } catch (e) {
+    console.error("POST /api/bet/finish error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ===== 6) Проверка живости API =====
 app.get("/", (req, res) => {
   res.json({ status: "API online" });
 });
